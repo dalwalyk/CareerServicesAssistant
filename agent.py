@@ -35,6 +35,16 @@ from tools import (
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
 MAX_TOKENS = 16000
 MAX_PAUSE_RESTARTS = 5
+# Caps model calls per runner so a runaway tool loop can't run up the bill.
+MAX_TOOL_ITERATIONS = 15
+
+# If Claude Opus 5 declines a request, the API retries it on a fallback model
+# within the same call instead of returning a refusal.
+FALLBACK_OPTIONS = (
+    {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
+    if MODEL == "claude-opus-5"
+    else {}
+)
 
 SYSTEM_PROMPT = """\
 You are a career services assistant running locally for one user. You help
@@ -58,6 +68,8 @@ file path doesn't exist or a tool errors, tell the user plainly what went
 wrong rather than making up an answer.
 """
 
+WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
+
 TOOLS = [
     read_document,
     list_directory,
@@ -70,11 +82,16 @@ TOOLS = [
     search_notes,
     calculate,
     get_current_datetime,
-    {"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
+    WEB_SEARCH_TOOL,
 ]
 
 
-def run_turn(client: anthropic.Anthropic, messages: list) -> "anthropic.types.beta.BetaMessage | None":
+def run_turn(
+    client: anthropic.Anthropic,
+    messages: list,
+    tools: list = TOOLS,
+    system: str = SYSTEM_PROMPT,
+) -> "anthropic.types.beta.BetaMessage | None":
     """Run one user turn to completion, handling any tool calls and mirroring
     every intermediate message back into `messages` so later turns keep full
     context. Restarts the runner if a long tool sequence pauses mid-turn.
@@ -85,9 +102,14 @@ def run_turn(client: anthropic.Anthropic, messages: list) -> "anthropic.types.be
         runner = client.beta.messages.tool_runner(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
+            max_iterations=MAX_TOOL_ITERATIONS,
+            # Cache the conversation prefix so each follow-up message (and any
+            # attached resume) isn't billed at the full input rate again.
+            cache_control={"type": "ephemeral"},
+            system=system,
+            tools=tools,
             messages=messages,
+            **FALLBACK_OPTIONS,
         )
         last = None
         for message in runner:
@@ -148,6 +170,9 @@ def main() -> None:
             continue
 
         if response is None:
+            continue
+        if response.stop_reason == "refusal":
+            print("agent> (Claude declined to answer that request.)")
             continue
 
         for block in response.content:
