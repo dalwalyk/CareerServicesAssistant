@@ -6,8 +6,10 @@ visitor gets a private tracker and notes held in their own browser session;
 nothing is written to the server's disk. Visitors can download a backup file
 and load it again on a later visit.
 
-All usage is billed to the host's Anthropic API key, so the app enforces a
-per-session message limit and a global daily limit (see README).
+The model is any OpenAI-compatible provider (Google Gemini's free tier by
+default), configured with LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL. All usage
+counts against the host's key and quota, so the app enforces a per-session
+message limit and a global daily limit (see README).
 
 Run locally:
     streamlit run app.py
@@ -25,14 +27,14 @@ import streamlit as st
 # On Streamlit Community Cloud, settings live in the app's Secrets; copy them
 # into the environment before importing modules that read it.
 try:
-    for _key in ("ANTHROPIC_API_KEY", "CLAUDE_MODEL", "ACCESS_CODE",
+    for _key in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL", "ACCESS_CODE",
                  "MAX_MESSAGES_PER_SESSION", "DAILY_MESSAGE_LIMIT"):
         if _key in st.secrets and _key not in os.environ:
             os.environ[_key] = str(st.secrets[_key])
 except Exception:  # no secrets file configured; fall back to env / .env
     pass
 
-import anthropic
+import openai
 
 import agent
 from tools import (
@@ -64,15 +66,14 @@ with:
   visitor's private tracker.
 - Interview prep and company research, saved as notes for later reference.
 - Comparing offers (base pay, hourly equivalents, raises) with the calculator.
-- Looking up current information about a company or role with web search.
 
 Use the tools rather than guessing: check the application tracker before
-claiming what's in it, use the calculator for any arithmetic, and use web
-search for anything that requires current information (recent company news,
-typical salary ranges, role expectations) rather than relying on training
-data alone. You can't open files on anyone's computer: if the visitor refers
-to a document that isn't attached, ask them to attach it with the upload box
-in the sidebar.
+claiming what's in it, and use the calculator for any arithmetic. You can't
+browse the web, so for anything that needs current information (recent
+company news, typical salary ranges), say that your knowledge may be out of
+date and suggest where the visitor can check. You can't open files on
+anyone's computer: if the visitor refers to a document that isn't attached,
+ask them to attach it with the upload box in the sidebar.
 
 Be concise, concrete, and honest — if a resume has a real gap or a cover
 letter is generic, say so plainly rather than being falsely encouraging. If a
@@ -114,8 +115,19 @@ def get_daily_usage() -> DailyUsage:
 
 
 @st.cache_resource
-def get_client() -> anthropic.Anthropic:
-    return anthropic.Anthropic()
+def get_client() -> openai.OpenAI:
+    return agent.make_client()
+
+
+def provider_name() -> str:
+    url = agent.LLM_BASE_URL
+    if "googleapis.com" in url:
+        return "Google's Gemini API"
+    if "groq.com" in url:
+        return "Groq"
+    if "localhost" in url or "127.0.0.1" in url:
+        return "an AI model run by the site owner"
+    return "a third-party AI provider"
 
 
 def init_session() -> None:
@@ -127,7 +139,6 @@ def init_session() -> None:
         *make_tracker_tools(state.store).values(),
         calculate,
         get_current_datetime,
-        agent.WEB_SEARCH_TOOL,
     ]
     state.messages = []  # full API history, including tool calls
     state.chat = []  # (role, text) pairs shown on screen
@@ -183,6 +194,10 @@ def render_sidebar() -> list:
             key=f"docs-{state.upload_key}",
             help="Attached files are sent with your next message.",
         )
+        st.caption(f"Uploaded documents are sent to {provider_name()} to "
+                   "generate replies. Don't upload sensitive personal "
+                   "information such as ID numbers, bank details, or your "
+                   "home address — remove it from your resume first.")
 
         st.header("Application tracker")
         applications = state.store.load("applications")
@@ -230,15 +245,15 @@ def render_sidebar() -> list:
             state.chat.clear()
             st.rerun()
         st.caption(
-            "Privacy: messages and attached files are sent to Anthropic's "
-            "Claude API to generate replies. This site doesn't save your "
-            "chats, files, tracker, or notes."
+            f"Privacy: messages and attached files are sent to {provider_name()} "
+            "to generate replies. This site doesn't save your chats, files, "
+            "tracker, or notes."
         )
     return attachments or []
 
 
 def build_user_content(prompt: str, attachments: list) -> tuple[str, str]:
-    """Return (content sent to Claude, text shown in the chat)."""
+    """Return (content sent to the model, text shown in the chat)."""
     documents, names = [], []
     for f in attachments:
         try:
@@ -259,30 +274,30 @@ def respond(content: str) -> str:
     turn_start = len(messages)
     messages.append({"role": "user", "content": content})
     try:
-        response = agent.run_turn(
+        reply = agent.run_turn(
             get_client(), messages, tools=st.session_state.tools, system=WEB_SYSTEM_PROMPT
         )
-    except (anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
+    except openai.APIError as exc:
         # Drop the failed turn so the history stays valid for the next try.
         del messages[turn_start:]
-        log.warning("Claude API error: %s", exc)
-        if isinstance(exc, anthropic.RateLimitError):
-            return "The assistant is busy right now. Please wait a minute and try again."
+        log.warning("LLM API error: %s", exc)
+        if isinstance(exc, openai.RateLimitError):
+            return agent.QUOTA_MESSAGE
+        if agent.is_busy_error(exc):
+            return agent.BUSY_MESSAGE
+        if agent.is_auth_error(exc):
+            return "The site's AI provider rejected its API key. The site owner needs to check LLM_API_KEY."
         return "Sorry, something went wrong reaching the assistant. Please try again."
 
-    if response is None:
-        return "Sorry, I didn't get a reply. Please try rephrasing."
-    if response.stop_reason == "refusal":
-        return "Sorry, I can't help with that request."
-    text = "\n\n".join(b.text for b in response.content if b.type == "text").strip()
-    return text or "Sorry, I didn't get a reply. Please try rephrasing."
+    return reply.strip() or "Sorry, I didn't get a reply. Please try rephrasing."
 
 
 def main() -> None:
     st.set_page_config(page_title="Career Services Assistant", page_icon="💼")
 
-    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-        st.error("The site owner hasn't configured an Anthropic API key yet.")
+    if not os.environ.get("LLM_API_KEY"):
+        st.error("LLM_API_KEY isn't set, so the assistant can't reply yet. The site "
+                 "owner needs to add it to the app's secrets or environment (see README).")
         st.stop()
 
     require_access_code()

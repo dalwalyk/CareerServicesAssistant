@@ -1,8 +1,8 @@
 """Tool implementations for the career services agent.
 
-Each function is a plain Python function decorated with @beta_tool so the
-Anthropic tool runner can turn it into a callable tool automatically from its
-signature and docstring.
+Each function is a plain Python function decorated with @tool, which builds
+its OpenAI-compatible function-calling schema from its signature and
+docstring, so it works with any OpenAI-compatible provider.
 
 The application tracker and notes tools read and write through a store, so the
 same tools can back the local CLI (JSON files in data/) and the web app (one
@@ -12,17 +12,90 @@ make_tracker_tools(); the module-level versions use the CLI's file store.
 
 import ast
 import csv
+import inspect
 import io
 import json
 import operator
+import re
 from datetime import datetime
 from pathlib import Path
-
-from anthropic import beta_tool
 
 DATA_DIR = Path(__file__).parent / "data"
 
 MAX_DOCUMENT_CHARS = 100_000
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions
+# ---------------------------------------------------------------------------
+
+_JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+
+def _parse_docstring(doc: str) -> tuple[str, dict]:
+    """Split a Google-style docstring into (description, {arg: description})."""
+    description, _, args_block = inspect.cleandoc(doc).partition("\nArgs:\n")
+    args, current, base_indent = {}, None, None
+    for line in args_block.splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        base_indent = indent if base_indent is None else base_indent
+        match = re.match(r"(\w+):\s*(.*)", line.strip())
+        if indent == base_indent and match:
+            current = match.group(1)
+            args[current] = match.group(2)
+        elif current:
+            args[current] += " " + line.strip()
+    return " ".join(description.split()), args
+
+
+class Tool:
+    """A Python function the model can call. Its OpenAI function-calling
+    schema is built from the function's signature and docstring."""
+
+    def __init__(self, func):
+        self.func = func
+        self.name = func.__name__
+        self.params = inspect.signature(func).parameters
+        description, arg_docs = _parse_docstring(func.__doc__ or "")
+        function = {"name": self.name, "description": description}
+        if self.params:
+            properties = {}
+            for name, param in self.params.items():
+                properties[name] = {"type": _JSON_TYPES.get(param.annotation, "string")}
+                if name in arg_docs:
+                    properties[name]["description"] = arg_docs[name]
+            function["parameters"] = {
+                "type": "object",
+                "properties": properties,
+                "required": [n for n, p in self.params.items() if p.default is inspect.Parameter.empty],
+            }
+        self.schema = {"type": "function", "function": function}
+
+    def __call__(self, *args, **kwargs):
+        return self.func(*args, **kwargs)
+
+    def call(self, arguments: dict) -> str:
+        """Run the tool with model-supplied arguments, returning errors as
+        text so the model can see what went wrong and recover."""
+        try:
+            kwargs = {}
+            for name, value in arguments.items():
+                if name not in self.params:
+                    return f"Error: {self.name} has no argument '{name}'."
+                # Some models send numbers as strings ("0"); coerce them.
+                if self.params[name].annotation in (int, float) and isinstance(value, (str, int, float)):
+                    value = self.params[name].annotation(value)
+                kwargs[name] = value
+            return str(self.func(**kwargs))
+        except Exception as exc:
+            return f"Error running {self.name}: {exc}"
+
+
+def tool(func) -> Tool:
+    """Decorator that turns a function into a Tool."""
+    return Tool(func)
 
 
 class FileStore:
@@ -121,7 +194,7 @@ def extract_text(filename: str, data: bytes) -> str:
     return _truncate(text)
 
 
-@beta_tool
+@tool
 def read_document(file_path: str) -> str:
     """Read and extract the text content of a document so it can be summarized,
     reviewed, or compared against a job description — a resume, cover letter,
@@ -163,7 +236,7 @@ def read_document(file_path: str) -> str:
     return _truncate(text)
 
 
-@beta_tool
+@tool
 def list_directory(directory_path: str = ".") -> str:
     """List files and subfolders in a directory, so the user can find a
     document to parse.
@@ -206,7 +279,7 @@ def make_tracker_tools(store) -> dict:
     """Build the application tracker and notes tools bound to `store` (a
     FileStore or MemoryStore). Returns them by name."""
 
-    @beta_tool
+    @tool
     def add_application(company: str, role: str, status: str = "applied", notes: str = "") -> str:
         """Add a job application to the tracker.
 
@@ -232,7 +305,7 @@ def make_tracker_tools(store) -> dict:
         store.save("applications", applications)
         return f"Added application #{len(applications) - 1}: {role} at {company} ({status})."
 
-    @beta_tool
+    @tool
     def list_applications(status: str = "") -> str:
         """List tracked job applications, optionally filtered by status.
 
@@ -253,7 +326,7 @@ def make_tracker_tools(store) -> dict:
             lines.append(f"{i}. {a['role']} at {a['company']} [{a['status']}]{note}")
         return "\n".join(lines)
 
-    @beta_tool
+    @tool
     def update_application(index: int, status: str = "", notes: str = "") -> str:
         """Update a tracked application's status and/or notes.
 
@@ -279,7 +352,7 @@ def make_tracker_tools(store) -> dict:
         a = applications[index]
         return f"Updated application #{index}: {a['role']} at {a['company']} [{a['status']}]."
 
-    @beta_tool
+    @tool
     def remove_application(index: int) -> str:
         """Delete a tracked application entirely.
 
@@ -293,7 +366,7 @@ def make_tracker_tools(store) -> dict:
         store.save("applications", applications)
         return f"Removed application: {removed['role']} at {removed['company']}."
 
-    @beta_tool
+    @tool
     def add_note(title: str, content: str) -> str:
         """Save a note for later reference — interview prep, company research,
         a recruiter's contact info, salary research, etc.
@@ -307,7 +380,7 @@ def make_tracker_tools(store) -> dict:
         store.save("notes", notes)
         return f"Saved note '{title}'."
 
-    @beta_tool
+    @tool
     def list_notes() -> str:
         """List the titles and creation dates of all saved notes."""
         notes = store.load("notes")
@@ -316,7 +389,7 @@ def make_tracker_tools(store) -> dict:
         lines = [f"{i}. {n['title']} ({n['created']})" for i, n in enumerate(notes)]
         return "\n".join(lines)
 
-    @beta_tool
+    @tool
     def search_notes(query: str) -> str:
         """Search saved notes by title or content.
 
@@ -382,7 +455,7 @@ def _eval_node(node):
     raise ValueError("expression contains unsupported syntax")
 
 
-@beta_tool
+@tool
 def calculate(expression: str) -> str:
     """Evaluate an arithmetic expression — useful for comparing offers, e.g.
     converting an annual salary to hourly ("95000 / 2080"), or computing a
@@ -401,7 +474,7 @@ def calculate(expression: str) -> str:
     return str(result)
 
 
-@beta_tool
+@tool
 def get_current_datetime() -> str:
     """Get the current local date and time."""
     return datetime.now().strftime("%A, %Y-%m-%d %H:%M:%S")
