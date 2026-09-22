@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """A standalone career services chatbot agent.
 
-Runs a chat loop backed by Claude, with tools for resume/job-description
-review, a job application tracker, interview and company research notes, an
-offer-comparison calculator, and web search for company/role research.
+Runs a chat loop backed by any OpenAI-compatible chat model (Google Gemini's
+free tier by default; Groq or a local Ollama model work too), with tools for
+resume/job-description review, a job application tracker, interview and
+company research notes, and an offer-comparison calculator.
+
+Configure it with LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL (see README).
 
 Usage:
     python agent.py
 """
 
+import json
 import os
 import sys
 
@@ -16,7 +20,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import anthropic
+import openai
 
 from tools import (
     add_application,
@@ -32,19 +36,13 @@ from tools import (
     update_application,
 )
 
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5")
-MAX_TOKENS = 16000
-MAX_PAUSE_RESTARTS = 5
-# Caps model calls per runner so a runaway tool loop can't run up the bill.
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.8-flash")
+# Caps model calls per turn so a runaway tool loop can't burn through quota.
 MAX_TOOL_ITERATIONS = 15
 
-# If Claude Opus 5 declines a request, the API retries it on a fallback model
-# within the same call instead of returning a refusal.
-FALLBACK_OPTIONS = (
-    {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
-    if MODEL == "claude-opus-5"
-    else {}
-)
+QUOTA_MESSAGE = "The free AI quota is used up, please try again later."
+AUTH_MESSAGE = "The AI provider rejected the API key. Check LLM_API_KEY."
 
 SYSTEM_PROMPT = """\
 You are a career services assistant running locally for one user. You help
@@ -54,21 +52,18 @@ with:
 - Tracking job applications: company, role, status, and notes.
 - Interview prep and company research, saved as notes for later reference.
 - Comparing offers (base pay, hourly equivalents, raises) with the calculator.
-- Looking up current information about a company or role with web search.
 
 Use the tools rather than guessing: read a file before reviewing it, check
-the application tracker before claiming what's in it, use the calculator for
-any arithmetic, and use web search for anything that requires current
-information (recent company news, typical salary ranges, role expectations)
-rather than relying on training data alone.
+the application tracker before claiming what's in it, and use the calculator
+for any arithmetic. You can't browse the web, so for anything that needs
+current information (recent company news, typical salary ranges), say that
+your knowledge may be out of date and suggest where the user can check.
 
 Be concise, concrete, and honest — if a resume has a real gap or a cover
 letter is generic, say so plainly rather than being falsely encouraging. If a
 file path doesn't exist or a tool errors, tell the user plainly what went
 wrong rather than making up an answer.
 """
-
-WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
 
 TOOLS = [
     read_document,
@@ -82,65 +77,100 @@ TOOLS = [
     search_notes,
     calculate,
     get_current_datetime,
-    WEB_SEARCH_TOOL,
 ]
 
 
+def make_client() -> openai.OpenAI:
+    """Create a client for the configured provider. Reads LLM_API_KEY from the
+    environment; never hardcode it."""
+    return openai.OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=LLM_BASE_URL)
+
+
+def is_auth_error(exc: openai.APIError) -> bool:
+    """True if the provider rejected the API key. Gemini reports a bad key as
+    400 "Please pass a valid API key" rather than 401."""
+    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+        return True
+    return isinstance(exc, openai.BadRequestError) and "api key" in str(exc).lower()
+
+
+def _assistant_entry(message) -> dict:
+    """Convert a response message into a history entry to send back."""
+    if not message.tool_calls:
+        return {"role": "assistant", "content": message.content or ""}
+    return {
+        "role": "assistant",
+        "content": message.content,
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.function.name, "arguments": call.function.arguments},
+                # Keep provider-specific fields (e.g. Gemini's thought
+                # signatures), which some models require to be sent back.
+                **(call.model_extra or {}),
+            }
+            for call in message.tool_calls
+        ],
+    }
+
+
+def _run_tool_call(tools_by_name: dict, call) -> str:
+    tool = tools_by_name.get(call.function.name)
+    if tool is None:
+        return f"Error: there is no tool named '{call.function.name}'."
+    try:
+        arguments = json.loads(call.function.arguments or "{}")
+    except json.JSONDecodeError:
+        return f"Error: the arguments for {call.function.name} weren't valid JSON."
+    if not isinstance(arguments, dict):
+        return f"Error: the arguments for {call.function.name} must be a JSON object."
+    return tool.call(arguments)
+
+
 def run_turn(
-    client: anthropic.Anthropic,
+    client: openai.OpenAI,
     messages: list,
     tools: list = TOOLS,
     system: str = SYSTEM_PROMPT,
-) -> "anthropic.types.beta.BetaMessage | None":
-    """Run one user turn to completion, handling any tool calls and mirroring
-    every intermediate message back into `messages` so later turns keep full
-    context. Restarts the runner if a long tool sequence pauses mid-turn.
+) -> str:
+    """Run one user turn to completion and return the reply text. Executes any
+    tool calls and appends every assistant and tool message to `messages` so
+    later turns keep full context. Raises openai.APIError on API failures.
     """
-    restarts = 0
-    last = None
-    while True:
-        runner = client.beta.messages.tool_runner(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            max_iterations=MAX_TOOL_ITERATIONS,
-            # Cache the conversation prefix so each follow-up message (and any
-            # attached resume) isn't billed at the full input rate again.
-            cache_control={"type": "ephemeral"},
-            system=system,
-            tools=tools,
-            messages=messages,
-            **FALLBACK_OPTIONS,
+    tools_by_name = {t.name: t for t in tools}
+    schemas = [t.schema for t in tools]
+    for _ in range(MAX_TOOL_ITERATIONS):
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "system", "content": system}, *messages],
+            tools=schemas,
         )
-        last = None
-        for message in runner:
-            last = message
-            messages.append({"role": "assistant", "content": message.content})
-            tool_response = runner.generate_tool_call_response()
-            if tool_response is not None:
-                messages.append(tool_response)
-
-        if last is not None and last.stop_reason == "pause_turn":
-            restarts += 1
-            if restarts > MAX_PAUSE_RESTARTS:
-                print("(agent paused repeatedly and gave up on this turn)")
-                return last
-            continue
-
-        return last
+        message = response.choices[0].message
+        messages.append(_assistant_entry(message))
+        if not message.tool_calls:
+            return message.content or ""
+        for call in message.tool_calls:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": _run_tool_call(tools_by_name, call),
+            })
+    return "(I stopped after too many tool calls without finishing. Please try rephrasing.)"
 
 
 def main() -> None:
-    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+    if not os.environ.get("LLM_API_KEY"):
         print(
-            "No ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) found.\n"
+            "No LLM_API_KEY found.\n"
             "Copy .env.example to .env and add your key, or export it in your shell."
         )
         sys.exit(1)
 
-    client = anthropic.Anthropic()
+    client = make_client()
     messages: list = []
 
-    print("Career services agent ready. Type 'exit' or 'quit' to stop.")
+    print(f"Career services agent ready ({LLM_MODEL}). Type 'exit' or 'quit' to stop.")
     print(
         "Try: 'read ~/Documents/resume.pdf and review it against this job "
         "description: ...', or 'add an application for Backend Engineer at Acme'.\n"
@@ -158,26 +188,25 @@ def main() -> None:
         if user_input.lower() in ("exit", "quit"):
             break
 
+        turn_start = len(messages)
         messages.append({"role": "user", "content": user_input})
 
         try:
-            response = run_turn(client, messages)
-        except anthropic.APIStatusError as exc:
-            print(f"(API error: {exc.message})")
-            continue
-        except anthropic.APIConnectionError:
-            print("(network error reaching the Claude API - check your connection)")
+            reply = run_turn(client, messages)
+        except openai.APIError as exc:
+            # Drop the failed turn so the history stays valid for the next try.
+            del messages[turn_start:]
+            if isinstance(exc, openai.RateLimitError):
+                print(f"({QUOTA_MESSAGE})")
+            elif is_auth_error(exc):
+                print(f"({AUTH_MESSAGE})")
+            elif isinstance(exc, openai.APIConnectionError):
+                print(f"(network error reaching {LLM_BASE_URL} - check your connection)")
+            else:
+                print(f"(API error: {exc})")
             continue
 
-        if response is None:
-            continue
-        if response.stop_reason == "refusal":
-            print("agent> (Claude declined to answer that request.)")
-            continue
-
-        for block in response.content:
-            if block.type == "text":
-                print(f"agent> {block.text}")
+        print(f"agent> {reply}")
 
 
 if __name__ == "__main__":
