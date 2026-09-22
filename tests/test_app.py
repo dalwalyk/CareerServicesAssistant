@@ -86,3 +86,10 @@ def test_bad_api_key_message(monkeypatch):
     at = AppTest.from_file(APP, default_timeout=30).run()
     at.chat_input[0].set_value("hello").run()
     assert "rejected its API key" in chat_texts(at)[-1]
+
+
+def test_busy_provider_message(monkeypatch):
+    monkeypatch.setattr(agent, "run_turn", fake_turn(error=status_error(openai.InternalServerError, 503)))
+    at = AppTest.from_file(APP, default_timeout=30).run()
+    at.chat_input[0].set_value("hello").run()
+    assert chat_texts(at)[-1] == "The AI service is busy right now, please try again in a minute."

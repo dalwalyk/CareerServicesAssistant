@@ -97,3 +97,13 @@ def test_is_auth_error():
     assert agent.is_auth_error(gemini_bad_key)
     assert not agent.is_auth_error(status_error(openai.BadRequestError, 400))
     assert not agent.is_auth_error(status_error(openai.RateLimitError, 429))
+
+
+def test_is_busy_error():
+    import httpx2
+    import openai
+    from conftest import status_error
+    assert agent.is_busy_error(status_error(openai.InternalServerError, 503))
+    assert agent.is_busy_error(openai.APITimeoutError(request=httpx2.Request("POST", "https://example.test")))
+    assert not agent.is_busy_error(status_error(openai.InternalServerError, 500))
+    assert not agent.is_busy_error(status_error(openai.RateLimitError, 429))

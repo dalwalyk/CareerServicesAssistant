@@ -283,6 +283,8 @@ def respond(content: str) -> str:
         log.warning("LLM API error: %s", exc)
         if isinstance(exc, openai.RateLimitError):
             return agent.QUOTA_MESSAGE
+        if agent.is_busy_error(exc):
+            return agent.BUSY_MESSAGE
         if agent.is_auth_error(exc):
             return "The site's AI provider rejected its API key. The site owner needs to check LLM_API_KEY."
         return "Sorry, something went wrong reaching the assistant. Please try again."

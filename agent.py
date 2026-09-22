@@ -43,6 +43,7 @@ MAX_TOOL_ITERATIONS = 15
 
 QUOTA_MESSAGE = "The free AI quota is used up, please try again later."
 AUTH_MESSAGE = "The AI provider rejected the API key. Check LLM_API_KEY."
+BUSY_MESSAGE = "The AI service is busy right now, please try again in a minute."
 
 SYSTEM_PROMPT = """\
 You are a career services assistant running locally for one user. You help
@@ -92,6 +93,14 @@ def is_auth_error(exc: openai.APIError) -> bool:
     if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
         return True
     return isinstance(exc, openai.BadRequestError) and "api key" in str(exc).lower()
+
+
+def is_busy_error(exc: openai.APIError) -> bool:
+    """True if the provider is temporarily overloaded or too slow to answer,
+    e.g. Gemini's 503 "This model is currently experiencing high demand"."""
+    if isinstance(exc, openai.APITimeoutError):
+        return True
+    return isinstance(exc, openai.APIStatusError) and exc.status_code in (502, 503, 504)
 
 
 def _assistant_entry(message) -> dict:
@@ -200,6 +209,8 @@ def main() -> None:
                 print(f"({QUOTA_MESSAGE})")
             elif is_auth_error(exc):
                 print(f"({AUTH_MESSAGE})")
+            elif is_busy_error(exc):
+                print(f"({BUSY_MESSAGE})")
             elif isinstance(exc, openai.APIConnectionError):
                 print(f"(network error reaching {LLM_BASE_URL} - check your connection)")
             else:
