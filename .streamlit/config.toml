@@ -1,0 +1,6 @@
+[server]
+# Largest resume / job description a visitor can upload, in MB.
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false
